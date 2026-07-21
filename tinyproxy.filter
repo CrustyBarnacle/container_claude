@@ -1,0 +1,24 @@
+# =============================================================================
+# tinyproxy.filter — Claude Code egress allowlist
+# =============================================================================
+# Domains the container is allowed to reach at runtime.
+# tinyproxy uses extended regular expressions (ERE) by default.
+# Each line is matched against the full hostname of the request.
+#
+# Syntax:
+#   exact.domain.com      matches only that host
+#   \.domain\.com$        matches domain.com and any subdomain
+#
+# To add a domain temporarily for a session, edit this file and send
+# SIGHUP to tinyproxy: kill -HUP $(cat /tmp/claude-sandbox-tinyproxy.pid)
+# No container restart needed.
+# =============================================================================
+
+# Anthropic API — all Claude Code inference calls
+api\.anthropic\.com$
+
+# Claude.ai — OAuth authentication flow
+claude\.ai$
+
+# Anthropic Console — API key / Console account auth
+platform\.claude\.com$

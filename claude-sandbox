@@ -1,0 +1,338 @@
+#!/usr/bin/env bash
+# =============================================================================
+# claude-sandbox — rootless Podman launcher for the Claude Code container
+# =============================================================================
+# Usage:
+#   claude-sandbox [OPTIONS] [-- CLAUDE_ARGS...]
+#
+# Options:
+#   -p, --project DIR     Mount DIR as /workspace (default: current directory)
+#   -r, --ro PATH         Add an extra read-only bind mount  (repeatable)
+#   -w, --rw PATH         Add an extra read-write bind mount (repeatable)
+#   --login               First-time auth: run `claude` inside to complete OAuth,
+#                         then run `claude setup-token` and update
+#                         ~/.claude/.credentials.json with the long-lived token.
+#   --no-creds            Do NOT mount ~/.claude at all (fully isolated / CI)
+#   --no-proxy            UNSAFE: skip tinyproxy egress filtering entirely.
+#                         Use only for troubleshooting — container has
+#                         unrestricted outbound access without this filter.
+#   --allow-net DOMAINS   Comma-separated extra domains to allow for this
+#                         session. Appended to filter before tinyproxy starts.
+#   --dry-run             Print the podman command, don't run it
+#   -h, --help            Show this help
+#
+# Egress filtering:
+#   tinyproxy runs on-demand (started before container, stopped after).
+#   Only these domains are reachable from the container at runtime:
+#     api.anthropic.com      — Claude API
+#     claude.ai              — OAuth authentication
+#     platform.claude.com    — Console authentication
+#   All other outbound HTTPS connections are rejected with a 403.
+#   To allow an additional domain for a session, use --allow-net.
+#
+#   The host LAN IP is derived dynamically at launch time and injected
+#   into the tinyproxy config — no manual updates needed on DHCP changes.
+#
+# Token management:
+#   Cloudflare blocks OAuth token refresh from container environments (HTTP
+#   403), causing short-lived tokens to expire. Fix: long-lived token written
+#   directly into ~/.claude/.credentials.json accessToken field.
+#
+#   Setup / renewal:
+#     1. claudecode --login
+#     2. Inside: claude setup-token  (copy the sk-ant-oat01-... value)
+#     3. Exit container
+#     4. jq '.claudeAiOauth.accessToken = "sk-ant-oat01-YOURTOKEN"' \
+#            ~/.claude/.credentials.json > /tmp/c.tmp \
+#        && mv /tmp/c.tmp ~/.claude/.credentials.json
+#
+# Environment variables (all optional):
+#   CLAUDE_SANDBOX_IMAGE   Image name/tag (default: localhost/claudecode:latest)
+#   CLAUDE_SANDBOX_DATA    Persistent data path (default: ~/.local/share/claude-sandbox)
+#
+# Examples:
+#   claude-sandbox                          # interactive session
+#   claude-sandbox --no-proxy               # UNSAFE: unrestricted outbound
+#   claude-sandbox --login                  # first-time / token renewal
+#   claude-sandbox --allow-net github.com   # allow extra domain this session
+#   claude-sandbox -p ~/projects/myapp -r ~/.gitconfig
+#   claude-sandbox -- "fix the auth bug in src/auth.ts"
+#   claude-sandbox --dry-run
+# =============================================================================
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Defaults
+# ---------------------------------------------------------------------------
+IMAGE="${CLAUDE_SANDBOX_IMAGE:-localhost/claudecode:latest}"
+DATA_DIR="${CLAUDE_SANDBOX_DATA:-${HOME}/.local/share/claude-sandbox}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+PROJECT_DIR="${PWD}"
+EXTRA_RO_MOUNTS=()
+EXTRA_RW_MOUNTS=()
+LOGIN_MODE=false
+NO_CREDS=false
+NO_PROXY=false
+DRY_RUN=false
+EXTRA_DOMAINS=""
+CLAUDE_ARGS=()
+
+# tinyproxy runtime files — all in /tmp, cleaned up on exit
+TINYPROXY_PID_FILE="/tmp/claude-sandbox-tinyproxy.pid"
+TINYPROXY_LOG_FILE="/tmp/claude-sandbox-tinyproxy.log"
+TINYPROXY_FILTER_FILE="/tmp/claude-sandbox-tinyproxy.filter"
+TINYPROXY_CONF_FILE="/tmp/claude-sandbox-tinyproxy.conf"
+TINYPROXY_PORT=8888
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -p|--project)
+            PROJECT_DIR="$(realpath "${2:?'--project requires a path'}")"
+            shift 2 ;;
+        -r|--ro)
+            EXTRA_RO_MOUNTS+=("$(realpath "${2:?'--ro requires a path'}")")
+            shift 2 ;;
+        -w|--rw)
+            EXTRA_RW_MOUNTS+=("$(realpath "${2:?'--rw requires a path'}")")
+            shift 2 ;;
+        --login)
+            LOGIN_MODE=true
+            shift ;;
+        --no-creds)
+            NO_CREDS=true
+            shift ;;
+        --no-proxy)
+            NO_PROXY=true
+            shift ;;
+        --allow-net)
+            EXTRA_DOMAINS="${2:?'--allow-net requires a domain list'}"
+            shift 2 ;;
+        --dry-run)
+            DRY_RUN=true
+            shift ;;
+        -h|--help)
+            sed -n '2,/^# ===/p' "$0" | grep '^#' | sed 's/^# \?//'
+            exit 0 ;;
+        --)
+            shift
+            CLAUDE_ARGS=("$@")
+            break ;;
+        *)
+            echo "Unknown option: $1" >&2
+            exit 1 ;;
+    esac
+done
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+if [[ ! -d "${PROJECT_DIR}" ]]; then
+    echo "ERROR: project directory does not exist: ${PROJECT_DIR}" >&2
+    exit 1
+fi
+
+if ! command -v podman &>/dev/null; then
+    echo "ERROR: podman not found in PATH" >&2
+    exit 1
+fi
+
+if ! podman image exists "${IMAGE}"; then
+    echo "ERROR: image '${IMAGE}' not found locally." >&2
+    echo "Build it first with:" >&2
+    echo "  podman build --build-arg CLAUDE_CODE_VERSION=2.1.197 \\" >&2
+    echo "               -t localhost/claudecode:2.1.197 \\" >&2
+    echo "               -t localhost/claudecode:latest ." >&2
+    exit 1
+fi
+
+if [[ "${NO_PROXY}" == "false" ]] && ! command -v tinyproxy &>/dev/null; then
+    echo "ERROR: tinyproxy not found. Install with: sudo pacman -S tinyproxy" >&2
+    echo "       Or bypass egress filtering with: --no-proxy (UNSAFE)" >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# tinyproxy on-demand management
+# ---------------------------------------------------------------------------
+
+start_tinyproxy() {
+    # Derive host LAN IP dynamically — pasta shares the host LAN interface
+    # with the container, so the container's source IP = host LAN IP.
+    # This avoids hardcoding an IP that breaks on DHCP reassignment.
+    local host_ip
+    host_ip="$(ip route get 1.1.1.1 | grep -oP 'src \K\S+')"
+
+    if [[ -z "${host_ip}" ]]; then
+        echo "ERROR: could not determine host LAN IP for tinyproxy Allow rule" >&2
+        echo "       Check: ip route get 1.1.1.1" >&2
+        return 1
+    fi
+
+    echo "  host LAN IP: ${host_ip}" >&2
+
+    # Copy config to /tmp and substitute the ALLOW_HOST_IP placeholder
+    sed "s/ALLOW_HOST_IP/${host_ip}/" \
+        "${SCRIPT_DIR}/tinyproxy.conf" > "${TINYPROXY_CONF_FILE}"
+
+    # Copy filter to /tmp
+    cp "${SCRIPT_DIR}/tinyproxy.filter" "${TINYPROXY_FILTER_FILE}"
+
+    # Append any extra domains requested via --allow-net
+    if [[ -n "${EXTRA_DOMAINS}" ]]; then
+        echo "" >> "${TINYPROXY_FILTER_FILE}"
+        echo "# Extra domains added via --allow-net" >> "${TINYPROXY_FILTER_FILE}"
+        IFS=',' read -ra DOMAINS <<< "${EXTRA_DOMAINS}"
+        for domain in "${DOMAINS[@]}"; do
+            domain="${domain// /}"
+            echo "${domain}" >> "${TINYPROXY_FILTER_FILE}"
+            echo "  + allowing extra domain: ${domain}" >&2
+        done
+    fi
+
+    echo "Starting tinyproxy egress filter (port ${TINYPROXY_PORT})..." >&2
+    tinyproxy -c "${TINYPROXY_CONF_FILE}"
+
+    # Wait up to 3 seconds for tinyproxy to be ready
+    local attempts=0
+    while [[ ${attempts} -lt 30 ]]; do
+        if [[ -f "${TINYPROXY_PID_FILE}" ]]; then
+            local pid
+            pid="$(cat "${TINYPROXY_PID_FILE}")"
+            if kill -0 "${pid}" 2>/dev/null; then
+                echo "  tinyproxy ready (pid ${pid})" >&2
+                return 0
+            fi
+        fi
+        sleep 0.1
+        (( attempts++ )) || true
+    done
+
+    echo "ERROR: tinyproxy failed to start. Check: ${TINYPROXY_LOG_FILE}" >&2
+    return 1
+}
+
+stop_tinyproxy() {
+    if [[ -f "${TINYPROXY_PID_FILE}" ]]; then
+        local pid
+        pid="$(cat "${TINYPROXY_PID_FILE}")"
+        if kill -0 "${pid}" 2>/dev/null; then
+            kill "${pid}"
+            echo "tinyproxy stopped (pid ${pid})" >&2
+        fi
+        rm -f "${TINYPROXY_PID_FILE}"
+    fi
+    rm -f "${TINYPROXY_CONF_FILE}" "${TINYPROXY_FILTER_FILE}"
+}
+
+# ---------------------------------------------------------------------------
+# Volume / data directory setup
+# ---------------------------------------------------------------------------
+mkdir -p "${DATA_DIR}/history"
+
+# ---------------------------------------------------------------------------
+# Build the podman run command
+# ---------------------------------------------------------------------------
+CMD=(
+    podman run
+    --rm
+    --interactive
+    --tty
+
+    # ---- User namespace ----
+    --userns=keep-id
+
+    # ---- Security ----
+    --cap-drop=ALL
+    --read-only
+    --tmpfs /tmp:rw,noexec,nosuid,size=256m
+    --tmpfs /run:rw,noexec,nosuid,size=64m
+    --security-opt no-new-privileges=true
+
+    # ---- Terminal ----
+    --env "TERM=${TERM:-xterm-256color}"
+
+    # ---- Core mounts ----
+    --volume "${PROJECT_DIR}:/workspace:rw,z"
+    --volume "${DATA_DIR}/history:/commandhistory:rw,z"
+
+    # ---- Working directory ----
+    --workdir /workspace
+
+    # ---- Labels ----
+    --label "claude-sandbox.project=${PROJECT_DIR}"
+    --label "claude-sandbox.version=2.1.197"
+)
+
+# ---- Egress proxy ----
+if [[ "${NO_PROXY}" == "false" ]]; then
+    CMD+=(
+        --env "HTTPS_PROXY=http://host.containers.internal:${TINYPROXY_PORT}"
+        --env "HTTP_PROXY=http://host.containers.internal:${TINYPROXY_PORT}"
+        --env "NO_PROXY=localhost,127.0.0.1"
+    )
+fi
+
+# ---- Credentials / config mount ----
+GLOBAL_CLAUDE_DIR="${HOME}/.claude"
+mkdir -p "${GLOBAL_CLAUDE_DIR}"
+
+if [[ "${NO_CREDS}" == "true" ]]; then
+    : # Don't mount ~/.claude at all
+elif [[ "${LOGIN_MODE}" == "true" ]]; then
+    CMD+=(--volume "${GLOBAL_CLAUDE_DIR}:/home/claude/.claude:rw,z")
+    echo "NOTE: --login mode." >&2
+    echo "      1. Run \`claude\` inside to complete OAuth." >&2
+    echo "      2. Run \`claude setup-token\` and copy the token." >&2
+    echo "      3. On the host, update the accessToken:" >&2
+    echo "         jq '.claudeAiOauth.accessToken = \"sk-ant-oat01-...\"' \\" >&2
+    echo "            ~/.claude/.credentials.json > /tmp/c.tmp \\" >&2
+    echo "         && mv /tmp/c.tmp ~/.claude/.credentials.json" >&2
+else
+    CMD+=(--volume "${GLOBAL_CLAUDE_DIR}:/home/claude/.claude:rw,z")
+fi
+
+# ---- Extra read-only mounts ----
+for path in "${EXTRA_RO_MOUNTS[@]:-}"; do
+    [[ -n "${path}" ]] || continue
+    CMD+=(--volume "${path}:${path}:ro,z")
+done
+
+# ---- Extra read-write mounts ----
+for path in "${EXTRA_RW_MOUNTS[@]:-}"; do
+    [[ -n "${path}" ]] || continue
+    CMD+=(--volume "${path}:${path}:rw,z")
+done
+
+# ---- Image and optional claude arguments ----
+CMD+=("${IMAGE}")
+
+if [[ ${#CLAUDE_ARGS[@]} -gt 0 ]]; then
+    CMD+=(claude "${CLAUDE_ARGS[@]}")
+fi
+
+# ---------------------------------------------------------------------------
+# Execute
+# ---------------------------------------------------------------------------
+if [[ "${DRY_RUN}" == "true" ]]; then
+    echo "# Dry run — would execute:"
+    if [[ "${NO_PROXY}" == "false" ]]; then
+        echo "# (tinyproxy would be started on port ${TINYPROXY_PORT})"
+        echo "# (host LAN IP derived dynamically via: ip route get 1.1.1.1)"
+    fi
+    printf '%q ' "${CMD[@]}"
+    echo
+    exit 0
+fi
+
+# Start tinyproxy, run container, stop tinyproxy on exit
+if [[ "${NO_PROXY}" == "false" ]]; then
+    trap stop_tinyproxy EXIT
+    start_tinyproxy
+fi
+
+"${CMD[@]}"
