@@ -237,11 +237,13 @@ pre-built image older than this fix, rebuild.
 
 Versions of claudecode >=2.1.88 issues, build with 2.1.87:
 
+```shell
 podman build --build-arg CLAUDE_CODE_VERSION=2.1.87 \
-             -t localhost/claudecode:2.1.87 \
-             -t localhost/claudecode:working .
+ -t localhost/claudecode:2.1.87 \
+ -t localhost/claudecode:working .
+```
 
-**tinyproxy fails to start**
+**tinyproxy fails to start**:
 Check the log: `cat /tmp/claude-sandbox-tinyproxy.log`
 Common causes: port 8888 already in use (`ss -tlnp | grep 8888`), or
 tinyproxy not installed (`which tinyproxy`).
