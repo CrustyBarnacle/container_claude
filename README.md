@@ -18,7 +18,7 @@ Install on the host before first use:
 
 ```bash
 # Arch Linux
-sudo pacman -S podman tinyproxy jq iproute2
+sudo pacman -S --needed podman tinyproxy jq iproute2
 
 # Debian / Ubuntu
 sudo apt install podman tinyproxy jq iproute2
@@ -32,6 +32,8 @@ the host LAN IP). `jq` is needed for the token management workflow below.
 
 ```bash
 # 1. Build the image (only needs network access once)
+The `-t` adds the `claudecode:<version>` and `claudecode:latest` tags. Add, remove, or edit to your liking and needs.
+
 podman build --build-arg CLAUDE_CODE_VERSION=2.1.197 \
              -t localhost/claudecode:2.1.197 \
              -t localhost/claudecode:latest .
@@ -232,6 +234,12 @@ read-only.  Fixed in this Containerfile: all dotfiles (`~/.bash_profile`,
 owned by the `claude` user during the image build, so bubblewrap finds them
 already in place and doesn't need to write them.  If you're using a
 pre-built image older than this fix, rebuild.
+
+Versions of claudecode >=2.1.88 issues, build with 2.1.87:
+
+podman build --build-arg CLAUDE_CODE_VERSION=2.1.87 \
+             -t localhost/claudecode:2.1.87 \
+             -t localhost/claudecode:working .
 
 **tinyproxy fails to start**
 Check the log: `cat /tmp/claude-sandbox-tinyproxy.log`
