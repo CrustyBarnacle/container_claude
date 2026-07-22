@@ -55,9 +55,10 @@ cd ~/projects/myapp
 
 The native Claude Code binary is self-contained — it does not need Node.js to
 run.  Using the slim Debian base drops the image from ~1 GB to ~150 MB and
-removes a large chunk of attack surface.  Node/npm are still available *inside*
-a session if Claude Code needs to run them as tools (it will install them on
-demand into `/workspace`).
+removes a large chunk of attack surface.  Node/npm are **not** included in the
+image.  If a session requires them, Claude Code would need to install a
+user-local runtime (e.g. via `nvm`), and the tinyproxy allowlist would need to
+be extended to permit the relevant download domains.
 
 ### Why no in-container iptables / NET_ADMIN?
 
