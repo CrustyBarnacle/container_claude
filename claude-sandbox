@@ -49,6 +49,7 @@
 # Environment variables (all optional):
 #   CLAUDE_SANDBOX_IMAGE   Image name/tag (default: localhost/claudecode:latest)
 #   CLAUDE_SANDBOX_DATA    Persistent data path (default: ~/.local/share/claude-sandbox)
+#   Currently using localhost/claudecode:working (with claudecode v2.1.87)
 #
 # Examples:
 #   claude-sandbox                          # interactive session
@@ -65,7 +66,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
-IMAGE="${CLAUDE_SANDBOX_IMAGE:-localhost/claudecode:latest}"
+IMAGE="${CLAUDE_SANDBOX_IMAGE:-localhost/claudecode:working}"
 DATA_DIR="${CLAUDE_SANDBOX_DATA:-${HOME}/.local/share/claude-sandbox}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -91,40 +92,51 @@ TINYPROXY_PORT=8888
 # ---------------------------------------------------------------------------
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -p|--project)
-            PROJECT_DIR="$(realpath "${2:?'--project requires a path'}")"
-            shift 2 ;;
-        -r|--ro)
-            EXTRA_RO_MOUNTS+=("$(realpath "${2:?'--ro requires a path'}")")
-            shift 2 ;;
-        -w|--rw)
-            EXTRA_RW_MOUNTS+=("$(realpath "${2:?'--rw requires a path'}")")
-            shift 2 ;;
-        --login)
-            LOGIN_MODE=true
-            shift ;;
-        --no-creds)
-            NO_CREDS=true
-            shift ;;
-        --no-proxy)
-            NO_PROXY=true
-            shift ;;
-        --allow-net)
-            EXTRA_DOMAINS="${2:?'--allow-net requires a domain list'}"
-            shift 2 ;;
-        --dry-run)
-            DRY_RUN=true
-            shift ;;
-        -h|--help)
-            sed -n '2,/^# ===/p' "$0" | grep '^#' | sed 's/^# \?//'
-            exit 0 ;;
-        --)
-            shift
-            CLAUDE_ARGS=("$@")
-            break ;;
-        *)
-            echo "Unknown option: $1" >&2
-            exit 1 ;;
+    -p | --project)
+        PROJECT_DIR="$(realpath "${2:?'--project requires a path'}")"
+        shift 2
+        ;;
+    -r | --ro)
+        EXTRA_RO_MOUNTS+=("$(realpath "${2:?'--ro requires a path'}")")
+        shift 2
+        ;;
+    -w | --rw)
+        EXTRA_RW_MOUNTS+=("$(realpath "${2:?'--rw requires a path'}")")
+        shift 2
+        ;;
+    --login)
+        LOGIN_MODE=true
+        shift
+        ;;
+    --no-creds)
+        NO_CREDS=true
+        shift
+        ;;
+    --no-proxy)
+        NO_PROXY=true
+        shift
+        ;;
+    --allow-net)
+        EXTRA_DOMAINS="${2:?'--allow-net requires a domain list'}"
+        shift 2
+        ;;
+    --dry-run)
+        DRY_RUN=true
+        shift
+        ;;
+    -h | --help)
+        sed -n '2,/^# ===/p' "$0" | grep '^#' | sed 's/^# \?//'
+        exit 0
+        ;;
+    --)
+        shift
+        CLAUDE_ARGS=("$@")
+        break
+        ;;
+    *)
+        echo "Unknown option: $1" >&2
+        exit 1
+        ;;
     esac
 done
 
@@ -177,19 +189,19 @@ start_tinyproxy() {
 
     # Copy config to /tmp and substitute the ALLOW_HOST_IP placeholder
     sed "s/ALLOW_HOST_IP/${host_ip}/" \
-        "${SCRIPT_DIR}/tinyproxy.conf" > "${TINYPROXY_CONF_FILE}"
+        "${SCRIPT_DIR}/tinyproxy.conf" >"${TINYPROXY_CONF_FILE}"
 
     # Copy filter to /tmp
     cp "${SCRIPT_DIR}/tinyproxy.filter" "${TINYPROXY_FILTER_FILE}"
 
     # Append any extra domains requested via --allow-net
     if [[ -n "${EXTRA_DOMAINS}" ]]; then
-        echo "" >> "${TINYPROXY_FILTER_FILE}"
-        echo "# Extra domains added via --allow-net" >> "${TINYPROXY_FILTER_FILE}"
-        IFS=',' read -ra DOMAINS <<< "${EXTRA_DOMAINS}"
+        echo "" >>"${TINYPROXY_FILTER_FILE}"
+        echo "# Extra domains added via --allow-net" >>"${TINYPROXY_FILTER_FILE}"
+        IFS=',' read -ra DOMAINS <<<"${EXTRA_DOMAINS}"
         for domain in "${DOMAINS[@]}"; do
             domain="${domain// /}"
-            echo "${domain}" >> "${TINYPROXY_FILTER_FILE}"
+            echo "${domain}" >>"${TINYPROXY_FILTER_FILE}"
             echo "  + allowing extra domain: ${domain}" >&2
         done
     fi
@@ -209,7 +221,7 @@ start_tinyproxy() {
             fi
         fi
         sleep 0.1
-        (( attempts++ )) || true
+        ((attempts++)) || true
     done
 
     echo "ERROR: tinyproxy failed to start. Check: ${TINYPROXY_LOG_FILE}" >&2
