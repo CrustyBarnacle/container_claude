@@ -66,7 +66,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
-IMAGE="${CLAUDE_SANDBOX_IMAGE:-localhost/claudecode:working}"
+IMAGE="${CLAUDE_SANDBOX_IMAGE:-localhost/claudecode:testing}"
 DATA_DIR="${CLAUDE_SANDBOX_DATA:-${HOME}/.local/share/claude-sandbox}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -156,8 +156,8 @@ fi
 if ! podman image exists "${IMAGE}"; then
     echo "ERROR: image '${IMAGE}' not found locally." >&2
     echo "Build it first with:" >&2
-    echo "  podman build --build-arg CLAUDE_CODE_VERSION=2.1.197 \\" >&2
-    echo "               -t localhost/claudecode:2.1.197 \\" >&2
+    echo "  podman build --build-arg CLAUDE_CODE_VERSION=2.1.218 \\" >&2
+    echo "               -t localhost/claudecode:2.1.218 \\" >&2
     echo "               -t localhost/claudecode:latest ." >&2
     exit 1
 fi
@@ -277,7 +277,7 @@ CMD=(
 
     # ---- Labels ----
     --label "claude-sandbox.project=${PROJECT_DIR}"
-    --label "claude-sandbox.version=2.1.197"
+    --label "claude-sandbox.version=2.1.218"
 )
 
 # ---- Egress proxy ----
